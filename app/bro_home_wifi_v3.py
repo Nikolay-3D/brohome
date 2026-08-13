@@ -57,17 +57,17 @@ ONE_SHOT_TAIL_SECONDS = 2.0
 VOSK_RATE = 16000
 ESP_READ_TIMEOUT = 5.0
 ESP_AUDIO_BUFFER_SECONDS = 10.0
+MIC_GAIN = max(0.1, min(4.0, float(os.environ.get("BROHOME_MIC_GAIN", "3.0"))))
+MIC_PEAK_LIMIT = 30000
 EXIT_UNKNOWN_COMMAND = 20
 EXIT_CONNECT_FAILED = 22
 
-WAKE_WORDS = [
-    "бро",
-    "про",
-    "брут",
-    "брат",
-    "было",
-    "броу",
-]
+# Only accept complete words.  The former substring matching also treated
+# ordinary TV words such as "программа" and "транспорт" as the alias "про".
+# "брок" is retained because the kitchen microphone has produced this stable
+# Vosk transcription for a clearly spoken "Бро".
+WAKE_WORDS = frozenset({"бро", "брок", "броу"})
+WAKE_PARTIAL_CONFIRMATIONS = 2
 
 
 @dataclass(frozen=True)
@@ -213,8 +213,8 @@ class ContinuousAudioReceiver:
 
 
 def has_wake_word(text: str) -> bool:
-    text = text.lower().strip()
-    return any(word in text for word in WAKE_WORDS)
+    words = re.findall(r"[0-9a-zа-яё]+", text.lower())
+    return any(word in WAKE_WORDS for word in words)
 
 
 def clean_text(text: str) -> str:
@@ -259,9 +259,9 @@ def clean_text(text: str) -> str:
 
 
 def command_after_wake_word(text: str) -> str:
-    words = text.split()
+    words = re.findall(r"[0-9a-zа-яё]+", text.lower())
     for index, word in enumerate(words):
-        if any(wake_word in word for wake_word in WAKE_WORDS):
+        if word in WAKE_WORDS:
             return " ".join(words[index + 1:]).strip()
     return ""
 
@@ -498,10 +498,15 @@ def adc_raw_to_pcm(raw: bytes) -> bytes:
         return b""
 
     center = sum(samples) / len(samples)
+    centered = [sample - center for sample in samples]
+    peak = max(abs(sample) for sample in centered)
+    # Restore far-field sensitivity while preventing the hard clipping that
+    # previously distorted loud speech and TV audio at a fixed 3x gain.
+    applied_gain = min(MIC_GAIN, MIC_PEAK_LIMIT / peak) if peak else MIC_GAIN
     pcm = bytearray()
 
-    for sample in samples:
-        value = int((sample - center) * 3.0)
+    for sample in centered:
+        value = int(sample * applied_gain)
         value = max(-32768, min(32767, value))
         pcm.extend(value.to_bytes(2, "little", signed=True))
 
@@ -605,6 +610,7 @@ def process_client(conn: socket.socket, address: tuple[str, int], model: Model) 
 
     print(f"BroHome слушает слово 'Бро'... Vosk: {VOSK_RATE} Гц")
     last_partial = ""
+    wake_partial_hits = 0
 
     while True:
         raw = recv_exact(receiver, chunk_bytes)
@@ -638,7 +644,16 @@ def process_client(conn: socket.socket, address: tuple[str, int], model: Model) 
             if final_text:
                 print("Vosk:", final_text)
 
-        if not has_wake_word(partial) and not has_wake_word(final_text):
+        if has_wake_word(partial):
+            wake_partial_hits += 1
+        else:
+            wake_partial_hits = 0
+
+        wake_confirmed = (
+            has_wake_word(final_text)
+            or wake_partial_hits >= WAKE_PARTIAL_CONFIRMATIONS
+        )
+        if not wake_confirmed:
             continue
 
         print("Бро услышал")
@@ -646,6 +661,7 @@ def process_client(conn: socket.socket, address: tuple[str, int], model: Model) 
         recognizer = KaldiRecognizer(model, VOSK_RATE)
         recognizer.SetWords(False)
         last_partial = ""
+        wake_partial_hits = 0
 
         if ONE_SHOT_ENABLED:
             print("Проверяю команду в одной фразе...")
@@ -680,6 +696,7 @@ def process_client(conn: socket.socket, address: tuple[str, int], model: Model) 
                     recognizer = KaldiRecognizer(model, VOSK_RATE)
                     recognizer.SetWords(False)
                     last_partial = ""
+                    wake_partial_hits = 0
                     pre_roll_pcm.clear()
                     print("Снова слушаю слово 'Бро'...")
                     continue
@@ -708,6 +725,7 @@ def process_client(conn: socket.socket, address: tuple[str, int], model: Model) 
         recognizer = KaldiRecognizer(model, VOSK_RATE)
         recognizer.SetWords(False)
         last_partial = ""
+        wake_partial_hits = 0
         pre_roll_pcm.clear()
         print("Снова слушаю слово 'Бро'...")
 
