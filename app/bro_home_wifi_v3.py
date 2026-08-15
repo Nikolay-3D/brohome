@@ -20,6 +20,7 @@ Flow:
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import socket
@@ -52,13 +53,14 @@ ALSA_DEVICE = os.environ.get("BROHOME_ALSA_DEVICE", "plughw:1,0")
 
 COMMAND_SECONDS = 4
 ONE_SHOT_ENABLED = True
-ONE_SHOT_PREROLL_SECONDS = 0.5
+ONE_SHOT_PREROLL_SECONDS = 2.0
 ONE_SHOT_TAIL_SECONDS = 2.0
 VOSK_RATE = 16000
 ESP_READ_TIMEOUT = 5.0
 ESP_AUDIO_BUFFER_SECONDS = 10.0
 MIC_GAIN = max(0.1, min(4.0, float(os.environ.get("BROHOME_MIC_GAIN", "3.0"))))
 MIC_PEAK_LIMIT = 30000
+MIC_HIGH_PASS_HZ = 100.0
 EXIT_UNKNOWN_COMMAND = 20
 EXIT_CONNECT_FAILED = 22
 
@@ -66,7 +68,10 @@ EXIT_CONNECT_FAILED = 22
 # ordinary TV words such as "программа" and "транспорт" as the alias "про".
 # "брок" is retained because the kitchen microphone has produced this stable
 # Vosk transcription for a clearly spoken "Бро".
-WAKE_WORDS = frozenset({"бро", "брок", "броу"})
+WAKE_WORDS = frozenset({
+    "бро", "брок", "броу", "брось", "бронь", "брон", "дро",
+    "кухня", "кухни",
+})
 WAKE_PARTIAL_CONFIRMATIONS = 2
 
 
@@ -77,6 +82,38 @@ class StreamInfo:
     bits: int
     channels: int
     encoding: str
+
+
+class MicrophoneHighPass:
+    """Two-stage high-pass filter that preserves state between audio chunks."""
+
+    def __init__(self, sample_rate: int, cutoff_hz: float = MIC_HIGH_PASS_HZ):
+        rc = 1.0 / (2.0 * math.pi * cutoff_hz)
+        self.alpha = rc / (rc + 1.0 / sample_rate)
+        self.previous_input = [0.0, 0.0]
+        self.previous_output = [0.0, 0.0]
+        self.initialized = [False, False]
+
+    def process(self, samples: list[float]) -> list[float]:
+        filtered: list[float] = []
+        for sample in samples:
+            value = sample
+            for stage in range(2):
+                if not self.initialized[stage]:
+                    self.previous_input[stage] = value
+                    self.initialized[stage] = True
+                    value = 0.0
+                    continue
+                output = self.alpha * (
+                    self.previous_output[stage]
+                    + value
+                    - self.previous_input[stage]
+                )
+                self.previous_input[stage] = value
+                self.previous_output[stage] = output
+                value = output
+            filtered.append(value)
+        return filtered
 
 
 @dataclass
@@ -485,7 +522,10 @@ def discard_buffered_audio(
     return receiver.discard()
 
 
-def adc_raw_to_pcm(raw: bytes) -> bytes:
+def adc_raw_to_pcm(
+    raw: bytes,
+    high_pass: Optional[MicrophoneHighPass] = None,
+) -> bytes:
     if len(raw) % 2:
         raw = raw[:-1]
 
@@ -499,6 +539,8 @@ def adc_raw_to_pcm(raw: bytes) -> bytes:
 
     center = sum(samples) / len(samples)
     centered = [sample - center for sample in samples]
+    if high_pass is not None:
+        centered = high_pass.process(centered)
     peak = max(abs(sample) for sample in centered)
     # Restore far-field sensitivity while preventing the hard clipping that
     # previously distorted loud speech and TV audio at a fixed 3x gain.
@@ -511,6 +553,19 @@ def adc_raw_to_pcm(raw: bytes) -> bytes:
         pcm.extend(value.to_bytes(2, "little", signed=True))
 
     return bytes(pcm)
+
+
+def pcm_rms_dbfs(pcm: bytes) -> float:
+    """Return the RMS level of signed 16-bit PCM in dBFS."""
+    count = len(pcm) // 2
+    if count == 0:
+        return -120.0
+    square_sum = 0
+    for index in range(0, count * 2, 2):
+        sample = int.from_bytes(pcm[index:index + 2], "little", signed=True)
+        square_sum += sample * sample
+    rms = math.sqrt(square_sum / count)
+    return 20.0 * math.log10(max(rms, 1.0) / 32768.0)
 
 
 def resample_pcm16_mono(pcm: bytes, src_rate: int, dst_rate: int) -> bytes:
@@ -604,6 +659,7 @@ def process_client(conn: socket.socket, address: tuple[str, int], model: Model) 
     chunk_bytes = chunk_samples * 2
     pre_roll_limit = round(info.rate * ONE_SHOT_PREROLL_SECONDS) * 2
     pre_roll_pcm = bytearray()
+    microphone_high_pass = MicrophoneHighPass(info.rate)
 
     recognizer = KaldiRecognizer(model, VOSK_RATE)
     recognizer.SetWords(False)
@@ -611,10 +667,14 @@ def process_client(conn: socket.socket, address: tuple[str, int], model: Model) 
     print(f"BroHome слушает слово 'Бро'... Vosk: {VOSK_RATE} Гц")
     last_partial = ""
     wake_partial_hits = 0
+    recent_audio_levels: list[float] = []
 
     while True:
         raw = recv_exact(receiver, chunk_bytes)
-        pcm = adc_raw_to_pcm(raw)
+        pcm = adc_raw_to_pcm(raw, microphone_high_pass)
+        recent_audio_levels.append(pcm_rms_dbfs(pcm))
+        del recent_audio_levels[:-4]
+        recent_level = max(recent_audio_levels)
         pre_roll_pcm.extend(pcm)
         if len(pre_roll_pcm) > pre_roll_limit:
             del pre_roll_pcm[:-pre_roll_limit]
@@ -628,7 +688,7 @@ def process_client(conn: socket.socket, address: tuple[str, int], model: Model) 
         ).get("partial", "").lower().strip()
 
         if partial and partial != last_partial:
-            print("Vosk partial:", partial)
+            print(f"Vosk partial: {partial} [audio {recent_level:.1f} dBFS]")
             last_partial = partial
 
         if not partial:
@@ -642,7 +702,7 @@ def process_client(conn: socket.socket, address: tuple[str, int], model: Model) 
             ).get("text", "").lower().strip()
 
             if final_text:
-                print("Vosk:", final_text)
+                print(f"Vosk: {final_text} [audio {recent_level:.1f} dBFS]")
 
         if has_wake_word(partial):
             wake_partial_hits += 1
@@ -667,7 +727,7 @@ def process_client(conn: socket.socket, address: tuple[str, int], model: Model) 
             print("Проверяю команду в одной фразе...")
             tail_bytes = round(info.rate * ONE_SHOT_TAIL_SECONDS) * 2
             tail_raw = recv_exact(receiver, tail_bytes)
-            tail_pcm = adc_raw_to_pcm(tail_raw)
+            tail_pcm = adc_raw_to_pcm(tail_raw, microphone_high_pass)
             save_command_wav(bytes(pre_roll_pcm) + tail_pcm, info.rate)
 
             one_shot_text = google_recognize()
@@ -711,7 +771,7 @@ def process_client(conn: socket.socket, address: tuple[str, int], model: Model) 
         print(f"Пишу команду {COMMAND_SECONDS} секунды...")
         command_bytes = round(info.rate * COMMAND_SECONDS) * 2
         command_raw = recv_exact(receiver, command_bytes)
-        command_pcm = adc_raw_to_pcm(command_raw)
+        command_pcm = adc_raw_to_pcm(command_raw, microphone_high_pass)
         save_command_wav(command_pcm, info.rate)
 
         recognized = google_recognize()
