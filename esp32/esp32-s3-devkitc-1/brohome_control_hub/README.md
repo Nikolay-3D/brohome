@@ -6,7 +6,7 @@
 
 ### Простой автоматический способ для Windows
 
-Установите Arduino IDE 2, подключите ESP32 и из корня проекта выполните:
+Установите Arduino IDE 2, подключите ESP32 и дважды щёлкните `FLASH-ESP32-WINDOWS.cmd` в корне проекта. Альтернативный запуск из PowerShell:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\flash-esp32.ps1

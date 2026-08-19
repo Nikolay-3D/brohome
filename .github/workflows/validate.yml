@@ -21,7 +21,9 @@ jobs:
       - name: Run Python tests
         run: python3 -m unittest discover -s tests -v
       - name: Validate shell scripts
-        run: bash -n install.sh uninstall.sh scripts/build-release.sh scripts/diagnose.sh app/start_brohome_wifi.sh
+        run: bash -n install.sh uninstall.sh INSTALL-SERVER-LINUX.sh scripts/build-release.sh scripts/diagnose.sh app/start_brohome_wifi.sh
+      - name: Check beginner entry points
+        run: test -f OPEN-ME-FIRST.txt -a -f FLASH-ESP32-WINDOWS.cmd -a -f INSTALL-SERVER-LINUX.sh
       - name: Validate PowerShell flasher syntax
         shell: pwsh
         run: |

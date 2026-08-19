@@ -11,7 +11,7 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 TEXT_SUFFIXES = {
-    ".c", ".cpp", ".h", ".ino", ".json", ".md", ".ps1", ".py", ".sh",
+    ".c", ".cmd", ".cpp", ".h", ".ino", ".json", ".md", ".ps1", ".py", ".sh",
     ".txt", ".yml", ".yaml",
 }
 FORBIDDEN_NAMES = {"secrets.h", ".env", "voice_full.wav", "hub_automations.json"}
