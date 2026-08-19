@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-VERSION="${1:-$(date +%Y%m%d)}"
+VERSION="${1:-$(tr -d '[:space:]' < "$ROOT/VERSION")}"
 ARCHIVE="$ROOT/brohome-control-hub-$VERSION.tar.gz"
 
 cd "$ROOT"
