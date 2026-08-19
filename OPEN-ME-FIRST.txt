@@ -1,7 +1,7 @@
-BROHOME CONTROL HUB - WHAT TO RUN FIRST
-=======================================
+BROHOME - WHAT TO RUN FIRST
+===========================
 
-Этот архив содержит две части:
+Этот архив содержит проект умного дома BroHome и две его основные части:
 
 1. Голосовой сервер для Debian/Ubuntu x86-64.
 2. Прошивку контроллера ESP32-S3.
@@ -54,7 +54,7 @@ BROHOME CONTROL HUB - WHAT TO RUN FIRST
 --------------------
 
 Откройте файл START_HERE.md на GitHub или в редакторе Markdown:
-https://github.com/Nikolay-3D/brohome-control-hub/blob/main/START_HERE.md
+https://github.com/Nikolay-3D/brohome/blob/main/START_HERE.md
 
 Если сервер BroHome уже установлен, шаг 1 можно пропустить и использовать его
 существующий IP-адрес.
