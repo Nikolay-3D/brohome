@@ -18,12 +18,13 @@
 #include "secrets.h"
 #include <WebServer.h>
 
-// Raw timings are the canonical saved form; only NEC decoding is enabled to
-// keep compilation and flash use small. Unknown protocols are still captured.
+// Raw timings are the canonical saved form. NEC and RC6 are decoded so they
+// can be reproduced with their protocol-specific repeat and toggle behaviour.
 #define RAW_BUFFER_LENGTH 2050
 #define USE_16_BIT_TIMING_BUFFER
 #define RECORD_GAP_MICROS 50000
 #define DECODE_NEC
+#define DECODE_RC6
 #include <IRremote.hpp>
 
 #include <RadioLib.h>
@@ -61,6 +62,16 @@ constexpr uint32_t RF_CAPTURE_MAX_MS = 700;
 constexpr float RF_RSSI_MARGIN_DB = 10.0f;
 constexpr float RF_RSSI_MIN_DBM = -85.0f;
 constexpr float RF_RSSI_MAX_DBM = -55.0f;
+constexpr uint16_t IR_REPEAT_GAP_MS = 90;
+constexpr uint32_t IR_SEQUENCE_CAPTURE_MS = 4000;
+constexpr uint16_t IR_SEQUENCE_SPLIT_GAP_MS = 250;
+constexpr uint8_t IR_SEQUENCE_MARKER = 2;       // Legacy single captured series.
+constexpr uint8_t IR_DUAL_SEQUENCE_MARKER = 3;  // Two series with alternating toggle.
+constexpr uint8_t IR_RAW_STREAM_MARKER = 4;
+constexpr uint8_t IR_SECOND_BANK_SENDS = 4;
+constexpr uint32_t IR_RAW_END_GAP_US = 180000;
+constexpr uint32_t IR_RAW_CAPTURE_MAX_MS = 1500;
+constexpr uint16_t IR_RAW_MIN_DURATIONS = 20;
 constexpr uint32_t COMMAND_MAGIC = 0x31435242;  // "BRC1", little endian.
 constexpr uint8_t COMMAND_VERSION = 1;
 const char* AUTOMATION_FILE = "/automations.tsv";
@@ -126,9 +137,17 @@ volatile uint16_t rfPulseCount = 0;
 volatile uint32_t rfLastEdgeUs = 0;
 volatile uint16_t rfPulses[MAX_PULSES];
 uint16_t commandPulseBuffer[MAX_PULSES];
+volatile bool irRawCapturing = false;
+volatile bool irRawStarted = false;
+volatile uint16_t irRawDurationCount = 0;
+volatile uint32_t irRawLastEdgeUs = 0;
+volatile uint32_t irRawDurations[MAX_PULSES / 2];
 
 volatile LearnJobState learnJobState = LearnJobState::Idle;
 CommandType learnJobType = CommandType::IR;
+uint8_t learnJobRepeats = 1;
+bool learnJobCaptureSequence = false;
+uint16_t learnJobCarrierKhz = 38;
 char learnJobName[49] = {};
 char learnJobMessage[96] = {};
 
@@ -178,6 +197,10 @@ bool parseType(const String& text, CommandType& type) {
     return true;
   }
   return false;
+}
+
+bool validIrCarrier(uint16_t carrierKhz) {
+  return carrierKhz == 36 || carrierKhz == 38 || carrierKhz == 40 || carrierKhz == 56;
 }
 
 String commandPath(CommandType type, const String& name) {
@@ -736,8 +759,100 @@ bool learnRf(const String& name) {
 }
 
 // --------------------------- IR capture ----------------------------------
-bool learnIr(const String& name) {
+void ARDUINO_ISR_ATTR onIrRawEdge() {
+  if (!irRawCapturing) return;
+  const uint32_t now = micros();
+  const uint8_t newLevel = digitalRead(PIN_IR_RX);
+  if (!irRawStarted) {
+    // Demodulating IR receivers are idle HIGH. The first falling edge is the
+    // exact beginning of the first modulated mark.
+    if (newLevel == LOW) {
+      irRawStarted = true;
+      irRawLastEdgeUs = now;
+    }
+    return;
+  }
+  const uint32_t elapsed = now - irRawLastEdgeUs;
+  irRawLastEdgeUs = now;
+  if (irRawDurationCount < MAX_PULSES / 2) {
+    irRawDurations[irRawDurationCount++] = elapsed;
+  } else {
+    irRawCapturing = false;
+  }
+}
+
+bool learnIrRawStream(const String& name, uint16_t carrierKhz) {
+  Serial.printf("LEARN ir_raw %s carrier=%u kHz: press the original remote button once\n",
+                name.c_str(), carrierKhz);
+  IrReceiver.stop();
+  pinMode(PIN_IR_RX, INPUT);
+  noInterrupts();
+  irRawCapturing = true;
+  irRawStarted = false;
+  irRawDurationCount = 0;
+  irRawLastEdgeUs = 0;
+  interrupts();
+  attachInterrupt(digitalPinToInterrupt(PIN_IR_RX), onIrRawEdge, CHANGE);
+
+  const uint32_t waitStarted = millis();
+  while (!irRawStarted && millis() - waitStarted < LEARN_TIMEOUT_MS) delay(1);
+  if (!irRawStarted) {
+    irRawCapturing = false;
+    detachInterrupt(digitalPinToInterrupt(PIN_IR_RX));
+    IrReceiver.start();
+    Serial.println("ERR raw IR learning timeout");
+    feedback("error");
+    return false;
+  }
+
+  const uint32_t captureStarted = millis();
+  while (irRawCapturing && millis() - captureStarted < IR_RAW_CAPTURE_MAX_MS) {
+    if (irRawDurationCount >= IR_RAW_MIN_DURATIONS &&
+        micros() - irRawLastEdgeUs > IR_RAW_END_GAP_US) {
+      break;
+    }
+    delay(1);
+  }
+  irRawCapturing = false;
+  detachInterrupt(digitalPinToInterrupt(PIN_IR_RX));
+
+  noInterrupts();
+  const uint16_t durationCount = irRawDurationCount;
+  for (uint16_t i = 0; i < durationCount; ++i) {
+    const uint32_t duration = irRawDurations[i];
+    commandPulseBuffer[i * 2] = duration & 0xFFFF;
+    commandPulseBuffer[i * 2 + 1] = duration >> 16;
+  }
+  interrupts();
+  IrReceiver.start();
+
+  if (durationCount < IR_RAW_MIN_DURATIONS) {
+    Serial.printf("ERR raw IR signal too short: %u durations\n", durationCount);
+    feedback("error");
+    return false;
+  }
+  const uint16_t words = durationCount * 2;
+  CommandHeader header{COMMAND_MAGIC, COMMAND_VERSION, static_cast<uint8_t>(CommandType::IR),
+                       IR_RAW_STREAM_MARKER, 1, carrierKhz, words, 0};
+  const bool saved = atomicSaveCommand(commandPath(CommandType::IR, name), header,
+                                       commandPulseBuffer);
+  if (!saved) {
+    Serial.println("ERR cannot save raw IR stream");
+    feedback("error");
+    return false;
+  }
+  uint64_t totalUs = 0;
+  for (uint16_t i = 0; i < durationCount; ++i) totalUs += irRawDurations[i];
+  Serial.printf("OK learned ir_raw %s durations=%u total=%llu us carrier=%u kHz\n",
+                name.c_str(), durationCount, totalUs, carrierKhz);
+  feedback("saved");
+  return true;
+}
+
+bool learnIr(const String& name, uint8_t repeats = 1, bool captureSequence = false,
+             uint16_t carrierKhz = 38) {
   feedback("learning_ir");
+  if (captureSequence) return learnIrRawStream(name, carrierKhz);
   Serial.printf("LEARN ir %s: press the original remote button\n", name.c_str());
   IrReceiver.start();
   const uint32_t started = millis();
@@ -746,20 +861,71 @@ bool learnIr(const String& name) {
       const bool overflow = (IrReceiver.decodedIRData.flags & IRDATA_FLAGS_WAS_OVERFLOW) != 0;
       const uint16_t rawLength = IrReceiver.irparams.rawlen;
       if (!overflow && rawLength > 3 && rawLength - 1 <= MAX_PULSES) {
+        if (captureSequence) {
+          uint16_t used = 0;
+          uint8_t frames = 0;
+          uint8_t banks = 1;
+          const uint32_t sequenceStarted = millis();
+          bool haveFrame = true;
+          while (millis() - sequenceStarted < IR_SEQUENCE_CAPTURE_MS) {
+            if (haveFrame || IrReceiver.decode()) {
+              haveFrame = false;
+              const bool frameOverflow =
+                  (IrReceiver.decodedIRData.flags & IRDATA_FLAGS_WAS_OVERFLOW) != 0;
+              const uint16_t frameRawLength = IrReceiver.irparams.rawlen;
+              const uint16_t framePulses = frameRawLength > 0 ? frameRawLength - 1 : 0;
+              if (!frameOverflow && framePulses > 2 && used + framePulses + 2 <= MAX_PULSES) {
+                const uint32_t gapUs =
+                    static_cast<uint32_t>(IrReceiver.decodedIRData.initialGapTicks) * MICROS_PER_TICK;
+                const uint16_t gapMs =
+                    frames == 0 ? 0 : min<uint32_t>(gapUs / 1000, UINT16_MAX);
+                if (frames > 0 && gapMs >= IR_SEQUENCE_SPLIT_GAP_MS) ++banks;
+                commandPulseBuffer[used++] = framePulses;
+                commandPulseBuffer[used++] = gapMs;
+                for (uint16_t i = 0; i < framePulses; ++i) {
+                  const uint32_t usec = IrReceiver.irparams.rawbuf[i + 1] * MICROS_PER_TICK;
+                  commandPulseBuffer[used++] = min<uint32_t>(usec, UINT16_MAX);
+                }
+                ++frames;
+              }
+              IrReceiver.resume();
+            }
+            delay(2);
+          }
+          if (frames < 4 || banks < 2) {
+            Serial.println("ERR IR sequence needs two separate button presses");
+            feedback("error");
+            return false;
+          }
+          CommandHeader header{COMMAND_MAGIC, COMMAND_VERSION, static_cast<uint8_t>(CommandType::IR),
+                               IR_DUAL_SEQUENCE_MARKER, frames, carrierKhz, used, 0};
+          const bool saved = atomicSaveCommand(commandPath(CommandType::IR, name), header,
+                                               commandPulseBuffer);
+          if (saved) {
+            Serial.printf("OK learned dual ir sequence %s banks=%u frames=%u words=%u duration=%lu ms\n",
+                          name.c_str(), banks, frames, used,
+                          static_cast<unsigned long>(IR_SEQUENCE_CAPTURE_MS));
+            feedback("saved");
+            return true;
+          }
+          Serial.println("ERR cannot save IR sequence");
+          feedback("error");
+          return false;
+        }
         const uint16_t count = rawLength - 1;
         for (uint16_t i = 0; i < count; ++i) {
           const uint32_t usec = IrReceiver.irparams.rawbuf[i + 1] * MICROS_PER_TICK;
           commandPulseBuffer[i] = min<uint32_t>(usec, UINT16_MAX);
         }
         CommandHeader header{COMMAND_MAGIC, COMMAND_VERSION, static_cast<uint8_t>(CommandType::IR),
-                             HIGH, 1, 38, count, 0};
+                             HIGH, max<uint8_t>(repeats, 1), carrierKhz, count, 0};
         const bool saved = atomicSaveCommand(commandPath(CommandType::IR, name), header, commandPulseBuffer);
         const String protocol = getProtocolString(IrReceiver.decodedIRData.protocol);
         const uint16_t bits = IrReceiver.decodedIRData.numberOfBits;
         IrReceiver.resume();
         if (saved) {
-          Serial.printf("OK learned ir %s pulses=%u protocol=%s bits=%u\n", name.c_str(), count,
-                        protocol.c_str(), bits);
+          Serial.printf("OK learned ir %s pulses=%u protocol=%s bits=%u repeats=%u carrier=%u kHz\n",
+                        name.c_str(), count, protocol.c_str(), bits, header.repeats, carrierKhz);
           feedback("saved");
           return true;
         }
@@ -815,14 +981,76 @@ bool sendCommand(CommandType type, const String& name) {
     IrReceiver.stop();
     uint16_t necAddress = 0;
     uint16_t necCommand = 0;
-    if (decodeStoredNec(header, commandPulseBuffer, necAddress, necCommand)) {
+    if (header.startLevel == IR_RAW_STREAM_MARKER) {
+      if ((header.pulseCount & 1) != 0 || header.pulseCount < IR_RAW_MIN_DURATIONS * 2) {
+        IrReceiver.start();
+        Serial.println("ERR corrupt raw IR stream");
+        return false;
+      }
+      IrSender.enableIROut(header.carrierKhz);
+      const uint16_t durationCount = header.pulseCount / 2;
+      for (uint16_t i = 0; i < durationCount; ++i) {
+        uint32_t remaining = static_cast<uint32_t>(commandPulseBuffer[i * 2]) |
+                             (static_cast<uint32_t>(commandPulseBuffer[i * 2 + 1]) << 16);
+        while (remaining > 0) {
+          const uint16_t chunk = min<uint32_t>(remaining, 60000);
+          if ((i & 1) == 0) IrSender.mark(chunk);
+          else IrSender.space(chunk);
+          remaining -= chunk;
+        }
+      }
+      Serial.printf("IR raw stream durations=%u\n", durationCount);
+    } else if (header.startLevel == IR_SEQUENCE_MARKER ||
+        header.startLevel == IR_DUAL_SEQUENCE_MARKER) {
+      uint8_t sentFrames = 0;
+      uint8_t bankCount = 0;
+      const bool dualSequence = header.startLevel == IR_DUAL_SEQUENCE_MARKER;
+      bool valid = true;
+      const uint8_t passes = dualSequence ? IR_SECOND_BANK_SENDS : 1;
+      for (uint8_t pass = 0; pass < passes && valid; ++pass) {
+        uint16_t position = 0;
+        uint8_t parsedFrames = 0;
+        uint8_t bank = 0;
+        while (position + 2 <= header.pulseCount) {
+          const uint16_t framePulses = commandPulseBuffer[position++];
+          const uint16_t gapMs = commandPulseBuffer[position++];
+          if (framePulses < 3 || position + framePulses > header.pulseCount) {
+            valid = false;
+            break;
+          }
+          const bool bankBoundary = parsedFrames > 0 && gapMs >= IR_SEQUENCE_SPLIT_GAP_MS;
+          if (bankBoundary) ++bank;
+          // First pass sends both states. Later passes reinforce only the second
+          // state, which this television needs for reliable power-off.
+          if (pass == 0 || bank > 0) {
+            if (sentFrames > 0) {
+              delay(bankBoundary ? IR_REPEAT_GAP_MS :
+                                   (gapMs > 0 ? gapMs : IR_REPEAT_GAP_MS));
+            }
+            IrSender.sendRaw(commandPulseBuffer + position, framePulses, header.carrierKhz);
+            ++sentFrames;
+          }
+          position += framePulses;
+          ++parsedFrames;
+        }
+        if (position != header.pulseCount) valid = false;
+        bankCount = max<uint8_t>(bankCount, bank + 1);
+      }
+      if (!valid || sentFrames == 0) {
+        IrReceiver.start();
+        Serial.println("ERR corrupt IR sequence");
+        return false;
+      }
+      Serial.printf("IR raw sequence banks=%u frames=%u second_bank_sends=%u\n",
+                    bankCount, sentFrames, dualSequence ? IR_SECOND_BANK_SENDS : 1);
+    } else if (decodeStoredNec(header, commandPulseBuffer, necAddress, necCommand)) {
       // Generate a canonical NEC frame and one correctly timed repeat frame.
       IrSender.sendNEC(necAddress, necCommand, 1);
       Serial.printf("IR NEC address=0x%02X command=0x%02X\n", necAddress, necCommand);
     } else {
       for (uint8_t repeat = 0; repeat < max<uint8_t>(header.repeats, 1); ++repeat) {
         IrSender.sendRaw(commandPulseBuffer, header.pulseCount, header.carrierKhz);
-        if (repeat + 1 < header.repeats) delay(40);
+        if (repeat + 1 < header.repeats) delay(IR_REPEAT_GAP_MS);
       }
     }
     IrReceiver.start();
@@ -1115,10 +1343,11 @@ button.secondary{background:#303b50;color:white}button.danger{background:var(--r
 </style></head><body><main>
 <h1>BroHome Control Hub</h1><p>Автономный ИК и 433 МГц пульт</p>
 <section class="card"><h2>Обучить команду</h2><div class="row">
-<select id="type"><option value="ir">ИК-пульт</option><option value="rf">433 МГц</option></select>
+<select id="type"><option value="ir">ИК-пульт</option><option value="ir_rc6">ИК — сырая запись</option><option value="rf">433 МГц</option></select>
+<select id="carrier"><option value="36">36 кГц — RC5/RC6</option><option value="38" selected>38 кГц — NEC и большинство</option><option value="40">40 кГц — Sony</option><option value="56">56 кГц</option></select>
 <input id="name" maxlength="48" pattern="[A-Za-z0-9_-]+" placeholder="например box_power">
 <button onclick="learn()">Начать обучение</button></div>
-<p>После нажатия кнопки поднесите оригинальный пульт и нажмите нужную клавишу.</p><div id="status"></div></section>
+<p>Частота сохраняется отдельно для каждой ИК-команды. Для режима «сырая запись» один раз коротко нажмите клавишу оригинального пульта.</p><div id="status"></div></section>
 <section class="card"><div class="row"><button class="secondary" onclick="loadCommands()">Обновить список</button>
 <a class="button" href="/api/backup">Скачать backup JSON</a></div><div id="commands"></div></section>
 <section class="card"><h2>Устройства и голосовые действия</h2>
@@ -1137,11 +1366,13 @@ button.secondary{background:#303b50;color:white}button.danger{background:var(--r
 const statusEl=document.getElementById('status');
 let learnedCommands=[];
 function params(type,name){return new URLSearchParams({type,name});}
+function syncCarrier(){let type=document.getElementById('type').value,carrier=document.getElementById('carrier');carrier.disabled=type==='rf';if(type==='ir_rc6')carrier.value='36';else if(type==='ir')carrier.value='38'}
 async function request(url,options){let r=await fetch(url,options);let text=await r.text();if(!r.ok)throw Error(text);return text;}
 async function learn(){let type=document.getElementById('type').value,name=document.getElementById('name').value.trim();
  if(!/^[A-Za-z0-9_-]{1,48}$/.test(name)){statusEl.textContent='Имя: только латинские буквы, цифры, _ и -';return}
  statusEl.textContent='Запускаю обучение…';
- try{await request('/api/learn?'+params(type,name),{method:'POST'});statusEl.textContent='Слушаю эфир — сейчас нажмите кнопку оригинального пульта…';
+  let carrier=document.getElementById('carrier').value;
+  try{await request('/api/learn?'+new URLSearchParams({type,name,carrier}),{method:'POST'});statusEl.textContent=type==='ir_rc6'?'Слушаю сырой поток — один раз коротко нажмите кнопку пульта…':'Слушаю эфир — сейчас нажмите кнопку оригинального пульта…';
   for(let i=0;i<50;i++){await new Promise(r=>setTimeout(r,500));try{let job=await (await fetch('/api/learn-status')).json();
    if(job.state==='running')continue;if(job.state==='success'){statusEl.textContent=job.message;await loadCommands();return}
    if(job.state==='error'){statusEl.textContent='Ошибка: '+job.message;return}}catch(e){/* Wi-Fi may be briefly busy; keep polling. */}}
@@ -1152,7 +1383,7 @@ async function removeCommand(type,name){if(!confirm('Удалить '+name+'?'))
 async function loadCommands(){let box=document.getElementById('commands');try{let rows=await (await fetch('/api/commands')).json();learnedCommands=rows;box.innerHTML='';
  let select=document.getElementById('command'),chosen=Array.from(select.selectedOptions).map(o=>o.value);select.innerHTML='';rows.forEach(c=>{let o=document.createElement('option');o.value=c.type+':'+c.name;o.textContent=c.type.toUpperCase()+' — '+c.name;o.selected=chosen.includes(o.value);select.append(o)});
  if(!rows.length){box.innerHTML='<p class="empty">Команд пока нет</p>';return}rows.forEach(c=>{let d=document.createElement('div');d.className='cmd';
- d.innerHTML='<div><b>'+c.name+'</b><br><small>'+c.type.toUpperCase()+' · '+c.pulses+' импульсов</small></div>';
+ d.innerHTML='<div><b>'+c.name+'</b><br><small>'+c.type.toUpperCase()+(c.type==='ir'?' · '+c.carrier_khz+' кГц':'')+' · '+c.pulses+' импульсов'+(c.repeats>1?' · '+c.repeats+' кадра':'')+'</small></div>';
  let a=document.createElement('div');a.className='actions';let s=document.createElement('button');s.textContent='Отправить';s.onclick=()=>send(c.type,c.name);
  let x=document.createElement('button');x.textContent='Удалить';x.className='danger';x.onclick=()=>removeCommand(c.type,c.name);a.append(s,x);d.append(a);box.append(d)})
  }catch(e){box.textContent='Не удалось загрузить список: '+e.message}}
@@ -1165,6 +1396,7 @@ function editAutomation(a){document.getElementById('automationId').value=a.id;do
 async function runAutomation(id){statusEl.textContent='Выполняю действие…';try{statusEl.textContent=await request('/api/automation/run?id='+encodeURIComponent(id),{method:'POST'})}catch(e){statusEl.textContent='Ошибка: '+e.message}}
 async function removeAutomation(id){if(!confirm('Удалить голосовое действие?'))return;try{await request('/api/automation/remove?id='+encodeURIComponent(id),{method:'POST'});await loadAutomations()}catch(e){statusEl.textContent='Ошибка: '+e.message}}
 async function loadAutomations(){let box=document.getElementById('automations');try{let data=await (await fetch('/api/automations')).json();box.innerHTML='';if(!data.actions.length){box.innerHTML='<p class="empty">Голосовых действий пока нет</p>';return}data.actions.forEach(a=>{let d=document.createElement('div');d.className='cmd';let info=document.createElement('div'),title=document.createElement('b');title.textContent=a.device+' — '+a.action;let detail=document.createElement('small');detail.textContent=(a.room?a.room+' · ':'')+a.type.toUpperCase()+' '+a.command+' · '+a.phrases;info.append(title,document.createElement('br'),detail);let controls=document.createElement('div');controls.className='actions';let test=document.createElement('button');test.textContent='Тест';test.onclick=()=>runAutomation(a.id);let edit=document.createElement('button');edit.textContent='Изменить';edit.className='secondary';edit.onclick=()=>editAutomation(a);let del=document.createElement('button');del.textContent='Удалить';del.className='danger';del.onclick=()=>removeAutomation(a.id);controls.append(test,edit,del);d.append(info,controls);box.append(d)})}catch(e){box.textContent='Не удалось загрузить действия: '+e.message}}
+document.getElementById('type').addEventListener('change',syncCarrier);syncCarrier();
 Promise.all([loadCommands(),loadAutomations()]);
 </script></body></html>
 )HTML";
@@ -1205,7 +1437,9 @@ void handleHttpCommands() {
       if (!first) json += ',';
       first = false;
       json += "{\"type\":\"" + String(typeText(type)) + "\",\"name\":\"" + name +
-              "\",\"pulses\":" + String(header.pulseCount) + "}";
+              "\",\"pulses\":" + String(header.pulseCount) +
+              ",\"repeats\":" + String(max<uint8_t>(header.repeats, 1)) +
+              ",\"carrier_khz\":" + String(header.carrierKhz) + "}";
     }
     entry.close();
     entry = dir.openNextFile();
@@ -1301,7 +1535,9 @@ void handleHttpAutomationRun() {
 
 void learningTask(void*) {
   const String name(learnJobName);
-  const bool ok = learnJobType == CommandType::IR ? learnIr(name) : learnRf(name);
+  const bool ok = learnJobType == CommandType::IR
+                      ? learnIr(name, learnJobRepeats, learnJobCaptureSequence, learnJobCarrierKhz)
+                      : learnRf(name);
   strlcpy(learnJobMessage, ok ? "Команда сохранена" : "Сигнал не получен — повторите обучение",
           sizeof(learnJobMessage));
   learnJobState = ok ? LearnJobState::Success : LearnJobState::Error;
@@ -1316,9 +1552,28 @@ void learningTask(void*) {
 
 void handleHttpLearn() {
   CommandType type;
-  String name;
-  if (!getHttpCommand(type, name)) {
+  const String requestedType = webServer.arg("type");
+  const String name = webServer.arg("name");
+  uint8_t repeats = 1;
+  bool captureSequence = false;
+  uint16_t carrierKhz = 38;
+  if (requestedType == "ir_rc6") {
+    type = CommandType::IR;
+    captureSequence = true;
+    carrierKhz = 36;
+  } else if (!parseType(requestedType, type)) {
     webServer.send(400, "text/plain; charset=utf-8", "Некорректный тип или имя команды");
+    return;
+  }
+  if (!validName(name)) {
+    webServer.send(400, "text/plain; charset=utf-8", "Некорректный тип или имя команды");
+    return;
+  }
+  if (type == CommandType::IR && webServer.hasArg("carrier")) {
+    carrierKhz = static_cast<uint16_t>(webServer.arg("carrier").toInt());
+  }
+  if (type == CommandType::IR && !validIrCarrier(carrierKhz)) {
+    webServer.send(400, "text/plain; charset=utf-8", "Выберите частоту 36, 38, 40 или 56 кГц");
     return;
   }
   if (learnJobState == LearnJobState::Running) {
@@ -1326,6 +1581,9 @@ void handleHttpLearn() {
     return;
   }
   learnJobType = type;
+  learnJobRepeats = repeats;
+  learnJobCaptureSequence = captureSequence;
+  learnJobCarrierKhz = carrierKhz;
   strlcpy(learnJobName, name.c_str(), sizeof(learnJobName));
   strlcpy(learnJobMessage, "Ожидание сигнала", sizeof(learnJobMessage));
   learnJobState = LearnJobState::Running;
