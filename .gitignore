@@ -12,6 +12,10 @@ brohome-control-hub-*.tar.gz
 brohome-control-hub-*.tar.gz.sha256
 brohome-control-hub-*.zip
 brohome-control-hub-*.sha256
+brohome-*.tar.gz
+brohome-*.tar.gz.sha256
+brohome-*.zip
+brohome-*.sha256
 brohome-remotes*.json
 *-remotes.json
 esp32/**/secrets.h

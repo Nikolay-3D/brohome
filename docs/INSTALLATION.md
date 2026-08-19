@@ -9,8 +9,8 @@
 Нужен включённый постоянно компьютер x86-64 с Debian/Ubuntu, Python 3.10–3.12, доступом в Интернет и домашнюю Wi-Fi-сеть. Raspberry Pi ARM пока не поддерживается вложенным набором wheel-файлов.
 
 ```bash
-git clone https://github.com/Nikolay-3D/brohome-control-hub.git
-cd brohome-control-hub
+git clone https://github.com/Nikolay-3D/brohome.git
+cd brohome
 sudo bash install.sh
 ```
 
@@ -66,7 +66,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\flash-esp32.ps1
 ## Обновление и удаление
 
 ```bash
-cd brohome-control-hub
+cd brohome
 git pull --ff-only
 sudo bash install.sh
 ```

@@ -24,17 +24,17 @@ jobs:
         shell: bash
         run: |
           version="${GITHUB_REF_NAME#v}"
-          prefix="brohome-control-hub-$version/"
-          git archive --format=zip --prefix="$prefix" -o "brohome-control-hub-$version.zip" HEAD
-          git archive --format=tar.gz --prefix="$prefix" -o "brohome-control-hub-$version.tar.gz" HEAD
-          sha256sum "brohome-control-hub-$version.zip" "brohome-control-hub-$version.tar.gz" > "brohome-control-hub-$version.sha256"
+          prefix="brohome-$version/"
+          git archive --format=zip --prefix="$prefix" -o "brohome-$version.zip" HEAD
+          git archive --format=tar.gz --prefix="$prefix" -o "brohome-$version.tar.gz" HEAD
+          sha256sum "brohome-$version.zip" "brohome-$version.tar.gz" > "brohome-$version.sha256"
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: >-
           gh release create "$GITHUB_REF_NAME"
-          brohome-control-hub-*.zip
-          brohome-control-hub-*.tar.gz
-          brohome-control-hub-*.sha256
-          --title "BroHome Control Hub $GITHUB_REF_NAME"
+          brohome-*.zip
+          brohome-*.tar.gz
+          brohome-*.sha256
+          --title "BroHome $GITHUB_REF_NAME"
           --generate-notes
