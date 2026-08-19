@@ -10,7 +10,10 @@ import sys
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-TEXT_SUFFIXES = {".c", ".cpp", ".h", ".ino", ".json", ".md", ".py", ".sh", ".txt", ".yml", ".yaml"}
+TEXT_SUFFIXES = {
+    ".c", ".cpp", ".h", ".ino", ".json", ".md", ".ps1", ".py", ".sh",
+    ".txt", ".yml", ".yaml",
+}
 FORBIDDEN_NAMES = {"secrets.h", ".env", "voice_full.wav", "hub_automations.json"}
 
 PATTERNS = [
@@ -58,7 +61,8 @@ def main() -> int:
             "BROHOME_AP_PASSWORD": {"CHANGE_THIS_PASSWORD"},
         }.items():
             match = re.search(rf"#define\s+{macro}\s+\"([^\"]+)\"", text)
-            if match and match.group(1) not in placeholders:
+            if (match and not match.group(1).startswith("$(ConvertTo-CString ")
+                    and match.group(1) not in placeholders):
                 errors.append(f"real {macro}: {relative}")
 
     if errors:

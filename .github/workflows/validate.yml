@@ -1,0 +1,56 @@
+name: Validate public package
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - name: Check for private files and secrets
+        run: python3 scripts/check_public_tree.py
+      - name: Run Python tests
+        run: python3 -m unittest discover -s tests -v
+      - name: Validate shell scripts
+        run: bash -n install.sh uninstall.sh scripts/build-release.sh scripts/diagnose.sh app/start_brohome_wifi.sh
+      - name: Validate PowerShell flasher syntax
+        shell: pwsh
+        run: |
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+            "$PWD/scripts/flash-esp32.ps1",
+            [ref]$null,
+            [ref]$errors
+          )
+          if ($errors.Count) {
+            $errors | Format-List
+            exit 1
+          }
+
+  esp32:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: arduino/setup-arduino-cli@v2
+      - name: Install ESP32 core and libraries
+        run: |
+          arduino-cli core update-index --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          arduino-cli core install esp32:esp32@3.3.8 --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          arduino-cli lib install IRremote@4.7.1
+          arduino-cli lib install RadioLib@7.6.0
+      - name: Create test-only settings
+        run: cp esp32/esp32-s3-devkitc-1/brohome_control_hub/secrets.example.h esp32/esp32-s3-devkitc-1/brohome_control_hub/secrets.h
+      - name: Compile ESP32-S3 N16R8 firmware
+        run: >-
+          arduino-cli compile
+          --fqbn esp32:esp32:esp32s3:USBMode=hwcdc,CDCOnBoot=cdc,FlashSize=16M,PartitionScheme=custom,PSRAM=opi,EraseFlash=none
+          esp32/esp32-s3-devkitc-1/brohome_control_hub
